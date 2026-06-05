@@ -32,3 +32,35 @@ END$$
 DELIMITER ;
 CALL auto_setup();
 DROP PROCEDURE auto_setup;
+
+__________________________________
+
+USE BD;
+
+
+SET @enc_key = '@eD=ffSj;lj3Jiljj;fefijJK54df64!';
+
+
+ALTER TABLE Users ADD COLUMN encrypted_password VARBINARY(255);
+
+
+UPDATE Users SET encrypted_password = AES_ENCRYPT(plain_password, @enc_key);
+
+
+ALTER TABLE Users DROP COLUMN plain_password;
+
+
+SELECT 
+    id,
+    username,
+    CAST(AES_DECRYPT(encrypted_password, @enc_key) AS CHAR) AS decrypted_password
+
+FROM Users;
+
+________________________________________
+
+# Дамп (выполнить в shell)
+mysqldump -u root -p BD > /tmp/BD_backup.sql
+
+# Восстановление
+mysql -u root -p BD < /tmp/BD_backup.sql
