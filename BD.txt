@@ -64,3 +64,589 @@ mysqldump -u root -p BD > /tmp/BD_backup.sql
 
 # Восстановление
 mysql -u root -p BD < /tmp/BD_backup.sql
+
+_________________________________________
+
+-- 1. Таблица покупателей (из файла Заказчики.json, только buyer = true)
+CREATE DATABASE IF NOT EXISTS BD_company;
+USE BD_company;
+
+CREATE TABLE buyers (
+    buyer_id VARCHAR(20) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    inn VARCHAR(20),
+    address VARCHAR(255),
+    phone VARCHAR(20)
+);
+
+INSERT INTO buyers (buyer_id, name, inn, address, phone) VALUES
+('000000010', 'ООО "Ассоль"', '2629011278', 'г. Калуга, ул. Пушкина, 94', '+79184572398'),
+('000000003', 'ООО "Ромашка"', '4140784214', 'г. Омск, ул. Строителей, 294', '+79882584546'),
+('000000009', 'ООО "Ипподром"', '5874045632', 'г. Уфа, ул. Набережная, 37', '+79627486389');
+
+-- 2. Таблица материалов
+CREATE TABLE materials (
+    material_id VARCHAR(20) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    unit VARCHAR(20),
+    cost_price DECIMAL(10,2) NOT NULL
+);
+
+INSERT INTO materials (material_id, name, unit, cost_price) VALUES
+('MAT001', 'Молоко нормализованное', 'кг', 34.00),
+('MAT002', 'Закваска сметанная', 'кг', 45.00),
+('MAT003', 'Закваска кефирная', 'кг', 40.00);
+
+-- 3. Таблица продукции
+CREATE TABLE products (
+    product_id VARCHAR(20) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    unit VARCHAR(20),
+    sale_price DECIMAL(10,2) NOT NULL
+);
+
+INSERT INTO products (product_id, name, unit, sale_price) VALUES
+('PR001', 'Кефир 2,5% 900г.', 'шт', 80.00),
+('PR002', 'Кефир 3,2% 900г.', 'шт', 82.00),
+('PR003', 'Сметана классическая 15% 540г.', 'шт', 89.00);
+
+-- 4. Спецификация (состав продукции)
+CREATE TABLE product_materials (
+    pm_id INT AUTO_INCREMENT PRIMARY KEY,
+    product_id VARCHAR(20),
+    material_id VARCHAR(20),
+    quantity DECIMAL(10,3) NOT NULL,
+    FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE CASCADE,
+    FOREIGN KEY (material_id) REFERENCES materials(material_id)
+);
+
+INSERT INTO product_materials (product_id, material_id, quantity) VALUES
+-- Кефир 2,5%
+('PR001', 'MAT001', 0.900),
+('PR001', 'MAT003', 0.050),
+-- Кефир 3,2%
+('PR002', 'MAT001', 0.900),
+('PR002', 'MAT003', 0.050),
+-- Сметана 15%
+('PR003', 'MAT001', 0.900),
+('PR003', 'MAT002', 0.070);
+
+-- 5. Заказы (заголовки)
+CREATE TABLE orders (
+    order_id INT AUTO_INCREMENT PRIMARY KEY,
+    order_number VARCHAR(50) NOT NULL,
+    order_date DATE NOT NULL,
+    buyer_id VARCHAR(20),
+    total_cost DECIMAL(10,2) DEFAULT 0,
+    FOREIGN KEY (buyer_id) REFERENCES buyers(buyer_id)
+);
+
+INSERT INTO orders (order_number, order_date, buyer_id, total_cost) VALUES
+('Заказ покупателя № 2', '2026-06-06', '000000010', 0),  -- total_cost будет рассчитан триггером
+('Заказ покупателя № 5', '2026-06-10', '000000003', 0),
+('Заказ покупателя № 7', '2026-07-01', '000000009', 0);
+
+-- 6. Позиции заказа
+CREATE TABLE order_items (
+    item_id INT AUTO_INCREMENT PRIMARY KEY,
+    order_id INT,
+    product_id VARCHAR(20),
+    quantity DECIMAL(10,2) NOT NULL,
+    product_cost DECIMAL(10,2) NOT NULL,  -- себестоимость единицы на момент заказа
+    total DECIMAL(10,2) NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES orders(order_id) ON DELETE CASCADE,
+    FOREIGN KEY (product_id) REFERENCES products(product_id)
+);
+
+-- Позиции для заказа №2 (Ассоль)
+INSERT INTO order_items (order_id, product_id, quantity, product_cost, total) VALUES
+(1, 'PR001', 12, 0, 0),   -- временные значения, будут пересчитаны триггером
+(1, 'PR002', 9,  0, 0),
+(1, 'PR003', 10, 0, 0);
+
+_______________________________________
+
+DELIMITER //
+
+CREATE PROCEDURE GetOrderSummary(IN start_date DATE, IN end_date DATE)
+BEGIN
+    SELECT 
+        b.name AS buyer_name,
+        COUNT(DISTINCT o.order_id) AS total_orders,
+        COALESCE(SUM(oi.quantity), 0) AS total_quantity,
+        COALESCE(SUM(o.total_cost), 0) AS total_amount
+    FROM buyers b
+    LEFT JOIN orders o ON b.buyer_id = o.buyer_id AND o.order_date BETWEEN start_date AND end_date
+    LEFT JOIN order_items oi ON o.order_id = oi.order_id
+    GROUP BY b.buyer_id, b.name
+    ORDER BY total_amount DESC;
+END //
+
+DELIMITER ;
+
+CALL GetOrderSummary('2026-06-01', '2026-06-30');
+
+_________________________________________ процедура
+
+DELIMITER //
+
+CREATE PROCEDURE GetOrderSummary(IN start_date DATE, IN end_date DATE)
+BEGIN
+    SELECT 
+        b.name AS buyer_name,
+        COUNT(DISTINCT o.order_id) AS total_orders,
+        COALESCE(SUM(oi.quantity), 0) AS total_quantity,
+        COALESCE(SUM(o.total_cost), 0) AS total_amount
+    FROM buyers b
+    LEFT JOIN orders o ON b.buyer_id = o.buyer_id AND o.order_date BETWEEN start_date AND end_date
+    LEFT JOIN order_items oi ON o.order_id = oi.order_id
+    GROUP BY b.buyer_id, b.name
+    ORDER BY total_amount DESC;
+END //
+
+DELIMITER ;
+
+___________________________________ триггер
+
+-- Вспомогательная функция для расчёта себестоимости продукта
+DELIMITER //
+
+CREATE FUNCTION GetProductCost(p_product_id VARCHAR(20))
+RETURNS DECIMAL(10,2)
+DETERMINISTIC
+BEGIN
+    DECLARE total_cost DECIMAL(10,2);
+    SELECT SUM(pm.quantity * m.cost_price) INTO total_cost
+    FROM product_materials pm
+    JOIN materials m ON pm.material_id = m.material_id
+    WHERE pm.product_id = p_product_id;
+    RETURN COALESCE(total_cost, 0);
+END //
+
+DELIMITER ;
+
+-- Триггер перед вставкой позиции: вычисляем product_cost и total
+DELIMITER //
+
+CREATE TRIGGER before_order_item_insert
+BEFORE INSERT ON order_items
+FOR EACH ROW
+BEGIN
+    SET NEW.product_cost = GetProductCost(NEW.product_id);
+    SET NEW.total = NEW.quantity * NEW.product_cost;
+END //
+
+DELIMITER ;
+
+-- Триггер после вставки позиции: обновляем итоговую сумму заказа
+DELIMITER //
+
+CREATE TRIGGER after_order_item_insert
+AFTER INSERT ON order_items
+FOR EACH ROW
+BEGIN
+    UPDATE orders 
+    SET total_cost = (
+        SELECT SUM(total) FROM order_items WHERE order_id = NEW.order_id
+    )
+    WHERE order_id = NEW.order_id;
+END //
+
+DELIMITER ;
+
+DELIMITER //
+
+CREATE TRIGGER after_order_item_delete
+AFTER DELETE ON order_items
+FOR EACH ROW
+BEGIN
+    UPDATE orders 
+    SET total_cost = COALESCE((SELECT SUM(total) FROM order_items WHERE order_id = OLD.order_id), 0)
+    WHERE order_id = OLD.order_id;
+END //
+
+DELIMITER ;
+
+_________________________ update
+
+use BD_company;
+UPDATE order_items 
+SET product_cost = GetProductCost(product_id),
+    total = quantity * GetProductCost(product_id)
+WHERE product_cost = 0;
+-- затем обновить orders.total_cost
+UPDATE orders o 
+SET total_cost = (SELECT SUM(total) FROM order_items WHERE order_id = o.order_id);
+
+__________________________ запросы
+
+-- 1. Создание архивных таблиц (копия структуры)
+CREATE TABLE orders_june2026 LIKE orders;
+CREATE TABLE order_items_june2026 LIKE order_items;
+
+-- 2. Перенос данных за июнь 2025 (включая связанные позиции)
+START TRANSACTION;
+
+-- Копируем заказы за июнь 2025 в архив
+INSERT INTO orders_june2026 
+SELECT * FROM orders 
+WHERE order_date BETWEEN '2026-06-01' AND '2026-06-30';
+
+-- Копируем позиции этих заказов в архив
+INSERT INTO order_items_june2026 
+SELECT oi.* 
+FROM order_items oi
+JOIN orders o ON oi.order_id = o.order_id
+WHERE o.order_date BETWEEN '2026-06-01' AND '2026-06-30';
+
+-- Удаляем перенесённые позиции (каскадно удалятся и заказы благодаря ON DELETE CASCADE)
+DELETE FROM orders 
+WHERE order_date BETWEEN '2026-06-01' AND '2026-06-30';
+
+COMMIT;
+
+_______________________________ интерфейс
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import pymysql
+from pymysql import MySQLError
+
+# ---------------------- Конфигурация подключения к БД ----------------------
+DB_CONFIG = {
+    'host': '10.15.233.221',
+    'user': 'sa',          # измените на своего пользователя
+    'password': '123',          # пароль, если есть
+    'database': 'BD_company',  # имя вашей базы данных
+    'charset': 'utf8mb4'
+}
+
+class DairyApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Анализ заказов - Молочный комбинат")
+        self.root.geometry("1400x600")
+
+        # Переменные для сортировки и фильтрации
+        self.sort_field = tk.StringVar(value="order_date")
+        self.sort_order = tk.StringVar(value="ASC")   # ASC или DESC
+        self.filter_buyer_id = tk.StringVar(value="")
+
+        # Список клиентов для фильтрации (id -> name)
+        self.buyers = {}
+
+        # Подключение к БД
+        self.connection = None
+        self.connect_to_db()
+
+        # Построение интерфейса
+        self.create_widgets()
+
+        # Загрузка начальных данных
+        self.load_buyers()
+        self.refresh_table()
+
+    # ---------------------- Работа с БД ----------------------
+    def connect_to_db(self):
+        """Устанавливает соединение с MariaDB, обрабатывая ошибки."""
+        try:
+            self.connection = pymysql.connect(**DB_CONFIG)
+        except MySQLError as e:
+            messagebox.showerror("Ошибка подключения", f"Не удалось подключиться к БД:\n{e}")
+            self.root.quit()
+
+    def execute_query(self, query, params=None, fetch=True):
+        """Выполняет запрос и возвращает результаты (или None при ошибке)."""
+        if not self.connection:
+            self.connect_to_db()
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(query, params or ())
+                if fetch:
+                    return cursor.fetchall()
+                self.connection.commit()
+        except MySQLError as e:
+            messagebox.showerror("Ошибка запроса", f"Запрос не выполнен:\n{e}\n\nSQL: {query}")
+            return None
+
+    def load_buyers(self):
+        """Загружает список клиентов (id и имя) для фильтрации."""
+        rows = self.execute_query("SELECT buyer_id, name FROM buyers ORDER BY name")
+        if rows:
+            self.buyers = {row[0]: row[1] for row in rows}
+            # Заполняем Combobox
+            buyer_list = [f"{name} (ID: {bid})" for bid, name in self.buyers.items()]
+            self.cb_buyer['values'] = buyer_list
+
+    def get_orders_query(self, with_filter=False, with_sort=True):
+        """
+        Формирует SQL-запрос для получения заказов.
+        Если with_filter=True, добавляет условие по выбранному клиенту.
+        Если with_sort=True, добавляет ORDER BY.
+        """
+        query = """
+            SELECT o.order_id, o.order_number, o.order_date,
+                   b.name AS buyer_name, o.total_cost
+            FROM orders o
+            JOIN buyers b ON o.buyer_id = b.buyer_id
+        """
+        params = []
+        if with_filter and self.filter_buyer_id.get():
+            query += " WHERE o.buyer_id = %s"
+            params.append(self.filter_buyer_id.get())
+
+        if with_sort:
+            # Безопасное преобразование поля для сортировки
+            allowed_fields = ['order_id', 'order_number', 'order_date', 'buyer_name', 'total_cost']
+            field = self.sort_field.get()
+            if field not in allowed_fields:
+                field = 'order_date'
+            order = self.sort_order.get().upper()
+            if order not in ('ASC', 'DESC'):
+                order = 'ASC'
+            query += f" ORDER BY {field} {order}"
+        return query, params
+
+    def refresh_table(self):
+        """Обновляет данные в таблице (с учётом фильтра и сортировки)."""
+        # Очищаем текущие данные
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+
+        # Получаем данные из БД
+        query, params = self.get_orders_query(with_filter=True, with_sort=True)
+        rows = self.execute_query(query, params)
+
+        if not rows:
+            self.update_statistics(0, 0.0)
+            return
+
+        total_orders = len(rows)
+        total_sum = sum(row[4] for row in rows if row[4] is not None)  # total_cost
+
+        # Заполняем таблицу
+        for row in rows:
+            # Форматируем дату и сумму
+            order_date = row[2].strftime("%d.%m.%Y") if row[2] else ""
+            total_cost = f"{row[4]:.2f}" if row[4] is not None else "0.00"
+            self.tree.insert("", tk.END, values=(row[0], row[1], order_date, row[3], total_cost),
+                             tags=('normal',))
+
+        self.update_statistics(total_orders, total_sum)
+
+        # После обновления данных сбрасываем выделение поиска (если было)
+        self.search_entry.delete(0, tk.END)
+        self.current_search_text = ""
+        self.highlight_search_term()
+
+    def update_statistics(self, count, total):
+        """Обновляет метки статистики."""
+        self.lbl_total_orders.config(text=f"Всего заказов: {count}")
+        self.lbl_total_sum.config(text=f"Общая сумма: {total:.2f} руб.")
+
+    # ---------------------- Сортировка ----------------------
+    def on_sort_changed(self, *args):
+        """Вызывается при изменении поля сортировки или направления."""
+        self.refresh_table()
+
+    # ---------------------- Фильтрация ----------------------
+    def apply_filter(self):
+        """Применяет фильтр по выбранному клиенту."""
+        selected = self.cb_buyer.get()
+        if not selected:
+            messagebox.showinfo("Фильтрация", "Выберите клиента из списка.")
+            return
+        # Извлекаем ID из строки вида "ООО Ромашка (ID: 000000003)"
+        try:
+            bid = selected.split("(ID: ")[1].rstrip(")")
+            self.filter_buyer_id.set(bid)
+        except IndexError:
+            messagebox.showerror("Ошибка", "Не удалось определить ID клиента.")
+            return
+        self.refresh_table()
+
+    def clear_filter(self):
+        """Сбрасывает фильтр и показывает все заказы."""
+        self.filter_buyer_id.set("")
+        self.cb_buyer.set("")
+        self.refresh_table()
+
+    # ---------------------- Поиск с подсветкой ----------------------
+    def highlight_search_term(self):
+        """Ищет введённую строку в ячейках таблицы и подсвечивает найденные."""
+        search_text = self.search_entry.get().strip()
+        self.current_search_text = search_text
+        # Сначала удаляем все старые теги
+        for item in self.tree.get_children():
+            self.tree.item(item, tags=('normal',))
+
+        if not search_text:
+            return
+
+        # Регистронезависимый поиск
+        search_lower = search_text.lower()
+        for item in self.tree.get_children():
+            values = self.tree.item(item, 'values')
+            # Проверяем каждое значение
+            for idx, val in enumerate(values):
+                if search_lower in str(val).lower():
+                    # Подсвечиваем всю строку цветом
+                    self.tree.item(item, tags=('found',))
+                    break  # достаточно подсветить строку один раз
+
+        # Настраиваем теги (цвет фона)
+        self.tree.tag_configure('found', background='lightgreen')
+        self.tree.tag_configure('normal', background='white')
+
+    def on_search(self):
+        """Вызывается по кнопке Найти."""
+        self.highlight_search_term()
+
+    # ---------------------- Построение GUI ----------------------
+    def create_widgets(self):
+        # Верхняя панель с элементами управления
+        control_frame = ttk.LabelFrame(self.root, text="Управление", padding=10)
+        control_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # --- Сортировка ---
+        sort_frame = ttk.Frame(control_frame)
+        sort_frame.pack(side=tk.LEFT, padx=10)
+
+        ttk.Label(sort_frame, text="Сортировать по:").pack(side=tk.LEFT, padx=5)
+        sort_fields = ['order_id', 'order_number', 'order_date', 'buyer_name', 'total_cost']
+        sort_names = ['ID заказа', 'Номер заказа', 'Дата заказа', 'Покупатель', 'Сумма']
+        self.sort_combo = ttk.Combobox(sort_frame, textvariable=self.sort_field,
+                                       values=sort_fields, state='readonly', width=15)
+        self.sort_combo.pack(side=tk.LEFT, padx=5)
+        # Подставляем читаемые имена, но значения оставляем поля
+        self.sort_combo['values'] = sort_fields
+        self.sort_combo.bind('<<ComboboxSelected>>', self.on_sort_changed)
+
+        ttk.Label(sort_frame, text="Направление:").pack(side=tk.LEFT, padx=5)
+        order_combo = ttk.Combobox(sort_frame, textvariable=self.sort_order,
+                                   values=['ASC', 'DESC'], state='readonly', width=8)
+        order_combo.pack(side=tk.LEFT, padx=5)
+        order_combo.bind('<<ComboboxSelected>>', self.on_sort_changed)
+
+        # --- Фильтр по клиенту ---
+        filter_frame = ttk.Frame(control_frame)
+        filter_frame.pack(side=tk.LEFT, padx=20)
+
+        ttk.Label(filter_frame, text="Клиент:").pack(side=tk.LEFT, padx=5)
+        self.cb_buyer = ttk.Combobox(filter_frame, state='readonly', width=40)
+        self.cb_buyer.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(filter_frame, text="Фильтровать", command=self.apply_filter).pack(side=tk.LEFT, padx=5)
+        ttk.Button(filter_frame, text="Показать все", command=self.clear_filter).pack(side=tk.LEFT, padx=5)
+
+        # --- Поиск ---
+        search_frame = ttk.Frame(control_frame)
+        search_frame.pack(side=tk.RIGHT, padx=10)
+
+        ttk.Label(search_frame, text="Поиск:").pack(side=tk.LEFT, padx=5)
+        self.search_entry = ttk.Entry(search_frame, width=25)
+        self.search_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Button(search_frame, text="Найти", command=self.on_search).pack(side=tk.LEFT, padx=5)
+
+        # --- Статистика (под панелью) ---
+        stats_frame = ttk.Frame(self.root)
+        stats_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.lbl_total_orders = ttk.Label(stats_frame, text="Всего заказов: 0", font=('Arial', 10, 'bold'))
+        self.lbl_total_orders.pack(side=tk.LEFT, padx=20)
+
+        self.lbl_total_sum = ttk.Label(stats_frame, text="Общая сумма: 0.00 руб.", font=('Arial', 10, 'bold'))
+        self.lbl_total_sum.pack(side=tk.LEFT, padx=20)
+
+        # --- Таблица с данными ---
+        table_frame = ttk.Frame(self.root)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        columns = ('order_id', 'order_number', 'order_date', 'buyer_name', 'total_cost')
+        self.tree = ttk.Treeview(table_frame, columns=columns, show='headings', selectmode='browse')
+
+        # Настройка заголовков
+        self.tree.heading('order_id', text='ID заказа')
+        self.tree.heading('order_number', text='Номер заказа')
+        self.tree.heading('order_date', text='Дата заказа')
+        self.tree.heading('buyer_name', text='Покупатель')
+        self.tree.heading('total_cost', text='Сумма, руб')
+
+        self.tree.column('order_id', width=80, anchor='center')
+        self.tree.column('order_number', width=180)
+        self.tree.column('order_date', width=100, anchor='center')
+        self.tree.column('buyer_name', width=250)
+        self.tree.column('total_cost', width=120, anchor='e')
+
+        # Добавляем scrollbar
+        scroll_y = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        scroll_x = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        scroll_y.grid(row=0, column=1, sticky='ns')
+        scroll_x.grid(row=1, column=0, sticky='ew')
+
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+
+        # Переменная для хранения текущей строки поиска (чтобы не терять подсветку после обновлений)
+        self.current_search_text = ""
+
+# ---------------------- Запуск приложения ----------------------
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DairyApp(root)
+    root.mainloop()
+
+______________________________________ руководство
+
+1. Назначение программы
+Приложение предназначено для просмотра и анализа заказов покупателей. Позволяет:
+
+сортировать заказы по любому столбцу,
+
+фильтровать заказы по конкретному клиенту,
+
+искать текст в таблице с подсветкой найденных строк,
+
+видеть общее количество заказов и их общую сумму.
+
+2. Интерфейс и работа
+2.1. Панель управления (вверху)
+Сортировка
+
+Поле «Сортировать по» – выберите столбец: ID заказа, Номер, Дата, Покупатель, Сумма.
+
+Поле «Направление» – ASC (по возрастанию) или DESC (по убыванию).
+После изменения данные в таблице сортируются автоматически.
+
+Фильтр по клиенту
+
+Выберите клиента из раскрывающегося списка.
+
+Нажмите «Фильтровать» – останутся только заказы этого клиента.
+
+Нажмите «Показать все» – вернутся все заказы.
+
+Поиск
+
+Введите слово или цифры в поле «Поиск».
+
+Нажмите «Найти» – строки, содержащие введённый текст (в любом столбце), подсветятся зелёным фоном.
+
+Чтобы снять подсветку, очистите поле поиска и нажмите «Найти» ещё раз.
+
+2.2. Статистика
+Под панелью управления отображаются:
+
+Всего заказов – количество заказов в текущем списке (с учётом фильтра).
+
+Общая сумма – суммарная себестоимость этих заказов.
+
+2.3. Таблица заказов
+В таблице показаны: ID заказа, номер, дата, покупатель, общая сумма заказа.
+
+Строки можно выделять мышью, данные нельзя редактировать прямо в таблице.
+
+Для просмотра полной информации о заказе (состав продукции) используйте другие отчёты (не входят в данное приложение).
